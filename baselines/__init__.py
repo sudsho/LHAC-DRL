@@ -7,15 +7,17 @@ from .morl import (
     RCPOScheduler,
     EnvelopeMORLScheduler,
     LPPOScheduler,
+    WeightedRLScheduler,
 )
 
 __all__ = [
-    "EDDScheduler",
-    "SlackScheduler",
-    "GAMIPScheduler",
-    "DQNDAFScheduler",
-    "PPOLagrangianScheduler",
-    "RCPOScheduler",
-    "EnvelopeMORLScheduler",
-    "LPPOScheduler",
+    'EDDScheduler',
+    'SlackScheduler',
+    'GAMIPScheduler',
+    'DQNDAFScheduler',
+    'PPOLagrangianScheduler',
+    'RCPOScheduler',
+    'EnvelopeMORLScheduler',
+    'LPPOScheduler',
+    'WeightedRLScheduler',
 ]
