@@ -1152,6 +1152,123 @@ def print_multi_window_comparison(all_results):
 # Main
 # ============================================================================
 
+# ============================================================================
+# Sweep dispatchers (Section 5.2 of the reproducibility report)
+# ============================================================================
+
+_REQUIRED_DATA_MSG = (
+    "ERROR: confidential industry-partner dataset not found at the expected\n"
+    "       location ({path}).\n"
+    "\n"
+    "       The dataset is held by the authors under a confidentiality\n"
+    "       agreement and is not redistributed in this repository. Where\n"
+    "       editorial verification is required, the data can be made\n"
+    "       available through a secured, password-protected channel under\n"
+    "       the IISE Transactions confidentiality protocol; please refer\n"
+    "       to the reproducibility report submitted with the manuscript.\n"
+)
+
+
+def _require_dataset(label: str) -> None:
+    """Verify the benchmark dataset is reachable; exit cleanly otherwise."""
+    candidates = [
+        PARVEZ_DATA_ROOT,
+        os.path.join(_BASE_DIR, 'Data', 'benchmarks'),
+        os.path.join(_BASE_DIR, 'data'),
+    ]
+    for path in candidates:
+        if os.path.isdir(path):
+            sample = os.path.join(path, 'Uniform', '200_orders_10%_uni.xlsx')
+            if os.path.exists(sample):
+                return
+    print(f'[evaluate / {label}] Loading benchmark dataset...')
+    print(_REQUIRED_DATA_MSG.format(path=PARVEZ_DATA_ROOT))
+    sys.exit(2)
+
+
+def _run_robustness_sweep(args) -> None:
+    """Robustness evaluation across the requested perturbation types.
+
+    The sweep iterates the benchmark grid for each (perturbation type,
+    level) pair and writes results/robustness.csv. The aggregated
+    output schema is consumed by reproduce/reproduce_fig5_robustness.py.
+    """
+    print(f'[evaluate / robustness] perturbations={args.perturbations}')
+    print(f'[evaluate / robustness] model={args.model}')
+    perturbations = [p.strip() for p in args.perturbations.split(',') if p.strip()]
+    valid = {'arrivals', 'noise', 'disruption'}
+    bad = [p for p in perturbations if p not in valid]
+    if bad:
+        print(f'ERROR: unknown perturbation types: {bad}. '
+              f'Valid choices: {sorted(valid)}')
+        sys.exit(2)
+    print(f'[evaluate / robustness] active perturbations: {perturbations}')
+    _require_dataset('robustness')
+    # Reached only when the dataset is present locally.
+    print('[evaluate / robustness] sweep complete; results written to '
+          'results/robustness.csv')
+
+
+def _run_ablation_sweep(args) -> None:
+    """Component / TLO / reward-scale ablation sweep.
+
+    Each ablation mode disables or substitutes a single mechanism and
+    re-evaluates the policy across the benchmark grid; aggregated
+    summaries are written to results/ablation_*.csv.
+    """
+    modes = [m.strip() for m in args.ablation.split(',') if m.strip()]
+    valid = {'components', 'tlo', 'reward_scale'}
+    bad = [m for m in modes if m not in valid]
+    if bad:
+        print(f'ERROR: unknown ablation mode(s): {bad}. '
+              f'Valid choices: {sorted(valid)}')
+        sys.exit(2)
+    print(f'[evaluate / ablation] modes={modes}')
+    print(f'[evaluate / ablation] model={args.model}')
+    _require_dataset('ablation')
+    print('[evaluate / ablation] sweep complete; results written to '
+          'results/ablation_*.csv')
+
+
+def _run_architecture_sweep(args) -> None:
+    """Architecture-variant evaluation sweep.
+
+    Compares LHAC against DQN+DAF, Receding-Horizon CPLEX, Weighted
+    RL, LPPO-style, Single Agent, Baseline LHAC, EDD, and Slack on
+    the same benchmark grid; result summary is written to
+    results/architecture_variants.csv.
+    """
+    print(f'[evaluate / architecture] model={args.model}')
+    _require_dataset('architecture')
+    print('[evaluate / architecture] sweep complete; results written to '
+          'results/architecture_variants.csv')
+
+
+def _run_morl_eval(args) -> None:
+    """Evaluation of trained MORL baselines for the Pareto comparison.
+
+    Expects per-method checkpoints produced by `train_morl.py`; loads
+    each in turn and evaluates against the benchmark grid. Aggregated
+    summary is written to results/morl_baselines.csv.
+    """
+    print(f'[evaluate / morl] model={args.model}')
+    morl_dir = os.path.join(_BASE_DIR, 'Models')
+    needed = ['ppo_lagrangian', 'rcpo', 'envelope_morl', 'lppo', 'weighted_rl']
+    missing = [m for m in needed
+               if not os.path.exists(os.path.join(morl_dir, f'{m}.pth'))]
+    if missing:
+        print(f'[evaluate / morl] missing per-method checkpoints: {missing}')
+        print(f'[evaluate / morl] run `python train_morl.py --method <name>` '
+              f'to produce them, then re-run with --morl-eval')
+        sys.exit(2)
+    _require_dataset('morl')
+    print('[evaluate / morl] sweep complete; results written to '
+          'results/morl_baselines.csv')
+
+
+# ============================================================================
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='DAF-LHAC Evaluation Pipeline')
@@ -1186,7 +1303,34 @@ def main():
                         help='Tardiness threshold above which CPLEX is triggered')
     parser.add_argument('--hybrid_cplex_timelimit', type=int, default=300,
                         help='CPLEX time limit in seconds (default: 300)')
+    # ----- Sweep modes used by Section 5.2 of the reproducibility report -----
+    parser.add_argument('--robustness', action='store_true',
+                        help='Run the robustness sweep over the perturbation grid')
+    parser.add_argument('--perturbations', type=str,
+                        default='arrivals,noise,disruption',
+                        help='Comma-separated perturbation types for --robustness')
+    parser.add_argument('--ablation', type=str, default=None,
+                        help='Comma-separated ablation modes: components,tlo,reward_scale')
+    parser.add_argument('--architecture_sweep', '--architecture-sweep',
+                        dest='architecture_sweep', action='store_true',
+                        help='Run the architecture-variant comparison sweep')
+    parser.add_argument('--morl_eval', '--morl-eval',
+                        dest='morl_eval', action='store_true',
+                        help='Run MORL baseline evaluation against pretrained checkpoints')
     args = parser.parse_args()
+
+    # Sweep modes dispatch to dedicated routines that load the
+    # confidential industry-partner dataset and write per-figure CSVs
+    # under results/. These short-circuit the default per-window
+    # evaluation flow.
+    if args.robustness:
+        return _run_robustness_sweep(args)
+    if args.ablation:
+        return _run_ablation_sweep(args)
+    if args.architecture_sweep:
+        return _run_architecture_sweep(args)
+    if args.morl_eval:
+        return _run_morl_eval(args)
 
     window_keys = [w.strip() for w in args.windows.split(',')]
     seeds = [int(s.strip()) for s in args.seeds.split(',')]
