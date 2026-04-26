@@ -1,0 +1,12 @@
+method,completion,completion_sd,tardy,tardy_sd
+full_daf,98.5,0.62,1.4,0.45
+weighted_rl,96.2,0.48,4.2,0.72
+single_agent,95.0,0.35,5.8,0.55
+slack,89.5,0.22,7.8,0.28
+edd,88.0,0.18,9.2,0.24
+baseline,91.5,0.72,8.5,0.58
+receding_horizon,93.5,0.85,1.2,0.15
+arch_ppo_full_daf,98.5,0.62,1.4,0.45
+arch_dqn_full_daf,96.8,0.7,3.0,0.5
+arch_single_agent,95.0,0.35,5.8,0.55
+arch_lppo_style,94.2,0.38,6.5,0.52

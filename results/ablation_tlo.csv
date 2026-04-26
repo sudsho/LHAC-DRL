@@ -1,0 +1,7 @@
+variant,completion,completion_sd,tardy,tardy_sd
+adaptive_tlo,98.5,0.62,1.4,0.45
+fixed_tlo_05,97.0,0.48,3.2,0.4
+fixed_tlo_10,96.2,0.44,4.0,0.38
+fixed_tlo_20,95.5,0.52,5.0,0.55
+no_tlo,94.0,0.75,5.8,0.7
+tlo_in_critic,95.8,0.68,4.5,0.58
