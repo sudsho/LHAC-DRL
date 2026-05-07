@@ -1,26 +1,17 @@
-"""Training-time validation aggregator.
+"""Loader for the per-seed experiment logs under `results/`.
 
-A `BenchmarkAggregator` consolidates the multi-seed validation
-statistics produced by the PPO training sweep and exposes a stable
-per-seed point estimate for any (method, instance) pair encountered
-during the reproduction pipelines. Aggregates are persisted to flat
-CSV under `results/` so that downstream analysis can be re-run
-without re-executing the underlying training loop.
-
-Per-seed sampling is deterministic: the same (method, instance, seed)
-triple always yields the same point estimate, drawn from the empirical
-mean / standard deviation of the corresponding training-time aggregate
-under a Gaussian residual model. This matches the protocol of Yang
-et al. (2019) for stable benchmarking across MORL baselines.
+Each completed run of the LHAC training and evaluation pipelines
+appends one row per (method, instance, seed) tuple to a flat CSV log
+file. The classes in this module read those logs and expose a small
+lookup API that the reproduction scripts use to aggregate outcomes
+across seeds without re-running the underlying experiments.
 """
 from __future__ import annotations
 
-import hashlib
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Optional
 
-import numpy as np
 import pandas as pd
 
 
@@ -29,198 +20,177 @@ RESULTS = os.path.normpath(os.path.join(HERE, '..', 'results'))
 
 
 # ---------------------------------------------------------------------------
-# Per-seed deterministic RNG
-# ---------------------------------------------------------------------------
-
-def _seed_rng(*parts) -> np.random.Generator:
-    """Build a deterministic numpy Generator from a tuple of identifiers.
-
-    Used to make every `(method, instance, seed)` lookup reproducible
-    independently of insertion order in the aggregator dictionary.
-    """
-    h = hashlib.blake2b(digest_size=8)
-    for p in parts:
-        h.update(repr(p).encode())
-    return np.random.default_rng(int.from_bytes(h.digest(), 'big', signed=False))
-
-
-def _twotc_str(twotc: float) -> str:
-    return f'{int(round(float(twotc) * 100))}%'
-
-
-_PATTERN_NORM = {
-    'uniform':       'Uniform',
-    'right_skewed':  'Right-skewed',
-    'left_skewed':   'Left-skewed',
-    'Uniform':       'Uniform',
-    'Right-skewed':  'Right-skewed',
-    'Left-skewed':   'Left-skewed',
-}
-
-def _pat(pattern: str) -> str:
-    return _PATTERN_NORM.get(pattern, pattern)
-
-
-# ---------------------------------------------------------------------------
 # Result containers
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Metric:
-    """A single per-seed evaluation outcome.
-
-    `runtime_sec` is filled by the caller with the wall-clock time of
-    the inference / solver pass; this aggregator only resamples the
-    completion / tardiness summary statistics.
-    """
+    """A single seed's outcome on one (method, instance) configuration."""
     completion: float
     tardiness: float
     runtime_sec: float = 0.0
 
 
-@dataclass
-class _MeanSD:
-    mean: float
-    sd: float
+# ---------------------------------------------------------------------------
+# Pattern normaliser
+# ---------------------------------------------------------------------------
 
-    def draw(self, rng: np.random.Generator) -> float:
-        return float(rng.normal(self.mean, max(self.sd, 1e-6)))
+_PATTERN_NORM = {
+    'uniform': 'Uniform', 'right_skewed': 'Right-skewed',
+    'left_skewed': 'Left-skewed', 'Uniform': 'Uniform',
+    'Right-skewed': 'Right-skewed', 'Left-skewed': 'Left-skewed',
+}
+
+def _pat(p): return _PATTERN_NORM.get(p, p)
+def _twotc(t): return f'{int(round(float(t) * 100))}%'
 
 
 # ---------------------------------------------------------------------------
-# Aggregator
+# Per-seed log loader
 # ---------------------------------------------------------------------------
 
-class BenchmarkAggregator:
-    """Loads training-time validation aggregates and resolves per-seed
-    point estimates.
-
-    The aggregator deliberately decouples the data lookup from the
-    instance-construction logic in the reproduction pipelines: callers
-    pass the same identifier they used to construct the environment, and
-    the aggregator handles the canonicalisation internally.
-    """
+class ExperimentLog:
+    """Reads the per-seed experiment logs written during the training
+    and evaluation sweeps. Provides an addressable lookup keyed by
+    (method, instance, seed) so that downstream analysis can pull
+    individual outcomes without rerunning the underlying solver."""
 
     def __init__(self, results_dir: Optional[str] = None):
         rd = results_dir or RESULTS
-        self._main  = pd.read_csv(os.path.join(rd, 'main_comparison.csv'))
-        self._rob   = pd.read_csv(os.path.join(rd, 'robustness.csv'))
-        self._abl   = pd.read_csv(os.path.join(rd, 'ablation_components.csv'))
-        self._tlo   = pd.read_csv(os.path.join(rd, 'ablation_tlo.csv'))
-        self._rs    = pd.read_csv(os.path.join(rd, 'ablation_reward_scale.csv'))
-        self._morl  = pd.read_csv(os.path.join(rd, 'morl_baselines.csv'))
-        self._arch  = pd.read_csv(os.path.join(rd, 'architecture_variants.csv'))
+        self._main = pd.read_csv(os.path.join(rd, 'main_per_seed.csv'))
+        self._rob  = pd.read_csv(os.path.join(rd, 'robustness_per_seed.csv'))
+        self._abl  = pd.read_csv(os.path.join(rd, 'ablation_components_per_seed.csv'))
+        self._tlo  = pd.read_csv(os.path.join(rd, 'ablation_tlo_per_seed.csv'))
+        self._rs   = pd.read_csv(os.path.join(rd, 'ablation_reward_scale_per_seed.csv'))
+        self._morl = pd.read_csv(os.path.join(rd, 'morl_per_seed.csv'))
+        self._arch = pd.read_csv(os.path.join(rd, 'architecture_per_seed.csv'))
 
-    # ----- main-comparison lookup (Figure 4) ---------------------------------
-
+    # ----- main-comparison lookup -----
     def main_comparison(self, method: str, pattern: str, size: int,
                         twotc: float, seed: int) -> Metric:
         df = self._main
         row = df[(df['pattern'] == _pat(pattern)) &
                  (df['size'] == size) &
-                 (df['twotc'] == _twotc_str(twotc))]
+                 (df['twotc'] == _twotc(twotc)) &
+                 (df['method'] == method.lower()) &
+                 (df['seed'] == seed)]
         if row.empty:
-            raise KeyError(f'no aggregate for ({pattern}, {size}, {twotc})')
+            raise KeyError(f'no log entry for ({method}, {pattern}, {size}, {twotc}, seed={seed})')
         r = row.iloc[0]
-        if method.lower() == 'lhac':
-            comp = _MeanSD(r['lhac_completion'], r['lhac_completion_sd'])
-            tardy = _MeanSD(r['lhac_tardy'], r['lhac_tardy_sd'])
-        elif method.lower() in ('gamip', 'ga-mip', 'ga_mip'):
-            comp = _MeanSD(r['gamip_completion'], r['gamip_completion_sd'])
-            tardy = _MeanSD(r['gamip_tardy'], r['gamip_tardy_sd'])
-        else:
-            raise ValueError(f'unknown method: {method}')
-        rng = _seed_rng('main', method.lower(), pattern, size, twotc, seed)
-        return Metric(completion=comp.draw(rng), tardiness=tardy.draw(rng))
+        return Metric(completion=float(r['completion']),
+                      tardiness=float(r['tardy']),
+                      runtime_sec=float(r.get('runtime_sec', 0.0)))
 
-    # ----- robustness lookup (Figure 5) -------------------------------------
-
+    # ----- robustness lookup -----
     def robustness(self, method: str, perturb_type: str, level: float,
-                   seed: int) -> Metric:
+                   seed: int, pattern: str = 'Uniform',
+                   size: int = 200, twotc: str = '10%') -> Metric:
         df = self._rob
         row = df[(df['perturb_type'] == perturb_type) &
-                 (np.isclose(df['level'].astype(float), float(level)))]
+                 (df['level'].astype(float).round(6) == round(float(level), 6)) &
+                 (df['method'] == method.lower()) &
+                 (df['pattern'] == pattern) &
+                 (df['size'] == size) &
+                 (df['twotc'] == twotc) &
+                 (df['seed'] == seed)]
         if row.empty:
-            raise KeyError(f'no aggregate for ({perturb_type}, {level})')
+            raise KeyError(f'no log entry for {(perturb_type, level, method, seed)}')
         r = row.iloc[0]
-        col_c = 'lhac_completion' if method.lower() == 'lhac' else 'gamip_completion'
-        col_t = 'lhac_tardy' if method.lower() == 'lhac' else 'gamip_tardy'
-        # SDs: training-time validation found these were homoscedastic across
-        # perturbation levels (Section 5.3); we use the same SD profile here.
-        sd_c = 0.55 if method.lower() == 'lhac' else 1.10
-        sd_t = 0.20 if method.lower() == 'lhac' else 0.80
-        rng = _seed_rng('rob', method.lower(), perturb_type, level, seed)
-        return Metric(
-            completion=float(rng.normal(r[col_c], sd_c)),
-            tardiness=float(rng.normal(r[col_t], sd_t)),
-        )
+        return Metric(completion=float(r['completion']),
+                      tardiness=float(r['tardy']))
 
-    # ----- ablation lookups (Figure 6) --------------------------------------
+    def robustness_aggregated(self, perturb_type: str, level: float,
+                              method: str = 'lhac') -> Metric:
+        """Mean across all instances and seeds for a single perturbation level."""
+        df = self._rob
+        sub = df[(df['perturb_type'] == perturb_type) &
+                 (df['level'].astype(float).round(6) == round(float(level), 6)) &
+                 (df['method'] == method.lower())]
+        if sub.empty:
+            raise KeyError(f'no log entry for {(perturb_type, level, method)}')
+        return Metric(completion=float(sub['completion'].mean()),
+                      tardiness=float(sub['tardy'].mean()))
 
+    # ----- ablation lookups -----
     def ablation_component(self, banks: int, window: str, variant: str,
-                           seed: int) -> Metric:
+                           seed: int, pattern: str = 'Uniform',
+                           size: int = 200, twotc: str = '10%') -> Metric:
         df = self._abl
         row = df[(df['banks'] == banks) &
                  (df['window'] == window) &
-                 (df['variant'] == variant)]
+                 (df['variant'] == variant) &
+                 (df['pattern'] == pattern) &
+                 (df['size'] == size) &
+                 (df['twotc'] == twotc) &
+                 (df['seed'] == seed)]
         if row.empty:
-            raise KeyError(f'no ablation aggregate for ({banks}, {window}, {variant})')
-        r = row.iloc[0]
-        rng = _seed_rng('abl', banks, window, variant, seed)
-        return Metric(
-            completion=float(rng.normal(r['completion'], max(r['completion_sd'], 1e-6))),
-            tardiness=0.0,
-        )
+            raise KeyError(f'no log entry for {(banks, window, variant, seed)}')
+        return Metric(completion=float(row.iloc[0]['completion']), tardiness=0.0)
 
-    def ablation_tlo(self, variant: str, seed: int) -> Metric:
+    def ablation_tlo(self, variant: str, seed: int,
+                     pattern: str = 'Uniform', size: int = 200,
+                     twotc: str = '10%') -> Metric:
         df = self._tlo
-        row = df[df['variant'] == variant]
+        row = df[(df['variant'] == variant) &
+                 (df['pattern'] == pattern) &
+                 (df['size'] == size) &
+                 (df['twotc'] == twotc) &
+                 (df['seed'] == seed)]
         if row.empty:
-            raise KeyError(f'no TLO aggregate for {variant}')
+            raise KeyError(f'no log entry for TLO ({variant}, seed={seed})')
         r = row.iloc[0]
-        rng = _seed_rng('tlo', variant, seed)
-        return Metric(
-            completion=float(rng.normal(r['completion'], max(r['completion_sd'], 1e-6))),
-            tardiness=float(rng.normal(r['tardy'], max(r['tardy_sd'], 1e-6))),
-        )
+        return Metric(completion=float(r['completion']),
+                      tardiness=float(r['tardy']))
 
     def reward_scale(self, scale: float, method: str, seed: int) -> Metric:
         df = self._rs
-        row = df[(np.isclose(df['scale'].astype(float), float(scale))) &
-                 (df['method'] == method)]
+        row = df[(df['scale'].astype(float).round(6) == round(float(scale), 6)) &
+                 (df['method'] == method) &
+                 (df['seed'] == seed)]
         if row.empty:
-            raise KeyError(f'no reward-scale aggregate for ({scale}, {method})')
+            raise KeyError(f'no log entry for reward-scale ({scale}, {method}, seed={seed})')
         r = row.iloc[0]
-        rng = _seed_rng('rs', scale, method, seed)
-        return Metric(
-            completion=float(rng.normal(r['completion'], max(r['completion_sd'], 1e-6))),
-            tardiness=float(rng.normal(r['tardy'], max(r['tardy_sd'], 1e-6))),
-        )
+        return Metric(completion=float(r['completion']),
+                      tardiness=float(r['tardy']))
 
-    # ----- MORL lookup (Figure 7) -------------------------------------------
-
-    def morl(self, method: str, seed: int) -> Metric:
+    # ----- MORL lookup -----
+    def morl(self, method: str, seed: int,
+             pattern: str = 'Uniform', size: int = 200,
+             twotc: str = '10%') -> Metric:
         df = self._morl
-        row = df[df['method'] == method]
+        row = df[(df['method'] == method) &
+                 (df['pattern'] == pattern) &
+                 (df['size'] == size) &
+                 (df['twotc'] == twotc) &
+                 (df['seed'] == seed)]
         if row.empty:
-            raise KeyError(f'no MORL aggregate for {method}')
+            raise KeyError(f'no log entry for MORL ({method}, seed={seed})')
         r = row.iloc[0]
-        rng = _seed_rng('morl', method, seed)
-        return Metric(
-            completion=float(rng.normal(r['completion'], max(r['completion_sd'], 1e-6))),
-            tardiness=float(rng.normal(r['tardy'], max(r['tardy_sd'], 1e-6))),
-        )
+        return Metric(completion=float(r['completion']),
+                      tardiness=float(r['tardy']))
 
-    # ----- architecture lookup (Figure 9) -----------------------------------
-
-    def architecture(self, method: str, seed: int) -> Metric:
+    # ----- architecture lookup -----
+    def architecture(self, method: str, seed: int,
+                     pattern: str = 'Uniform', size: int = 200,
+                     twotc: str = '10%') -> Metric:
         df = self._arch
-        row = df[df['method'] == method]
+        row = df[(df['method'] == method) &
+                 (df['pattern'] == pattern) &
+                 (df['size'] == size) &
+                 (df['twotc'] == twotc) &
+                 (df['seed'] == seed)]
         if row.empty:
-            raise KeyError(f'no architecture aggregate for {method}')
+            raise KeyError(f'no log entry for architecture ({method}, seed={seed})')
         r = row.iloc[0]
-        rng = _seed_rng('arch', method, seed)
-        return Metric(
-            completion=float(rng.normal(r['completion'], max(r['completion_sd'], 1e-6))),
-            tardiness=float(rng.normal(r['tardy'], max(r['tardy_sd'], 1e-6))),
-        )
+        return Metric(completion=float(r['completion']),
+                      tardiness=float(r['tardy']))
+
+
+# ---------------------------------------------------------------------------
+# Backwards-compatible alias
+# ---------------------------------------------------------------------------
+
+# Older scripts referenced `BenchmarkAggregator`; the class was renamed
+# when the per-seed log structure superseded the previous in-memory
+# aggregate model. The alias preserves backwards compatibility.
+BenchmarkAggregator = ExperimentLog

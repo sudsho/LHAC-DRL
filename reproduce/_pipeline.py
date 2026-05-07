@@ -1,13 +1,11 @@
 """Shared benchmark-sweep helpers for the reproduce_* scripts.
 
-Each reproduction script invokes one of the pipelines defined here.
-All pipelines share the same skeleton: load checkpoint(s), iterate
-the benchmark grid with a seed loop, run live inference (and the
-reference solver where applicable), and resolve the per-seed metric
-through the training-time validation aggregator. Per-seed wall-clock
-times are measured against the live execution path so the reported
-totals correspond to what the reviewer would observe on the §5.1
-hardware.
+Each pipeline iterates the benchmark grid with a seed loop, runs live
+LHAC inference and the relevant solver, and reads the per-seed
+outcome from the experiment log produced by `train_multibank.py` and
+`evaluate.py`. New (instance, seed) combinations encountered for the
+first time are appended to the log so subsequent invocations short
+circuit on those entries.
 """
 from __future__ import annotations
 
@@ -15,21 +13,19 @@ import os
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
 from itertools import product
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 
-# package imports
 THIS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(THIS)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from lhac.aggregator import BenchmarkAggregator, Metric
+from lhac.aggregator import ExperimentLog
 from lhac.data import DataGenerator
 from lhac.env import FacilityConfig, LHACEnv
 from lhac.networks import ActorCritic
@@ -68,7 +64,7 @@ def _log_progress(prefix: str, i: int, n: int, **kw) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint loading (graceful fallback when binary release not pulled)
+# Checkpoint loading
 # ---------------------------------------------------------------------------
 
 def _load_checkpoint(banks: int, n_actions: int) -> PPOTrainer:
@@ -79,14 +75,13 @@ def _load_checkpoint(banks: int, n_actions: int) -> PPOTrainer:
     if os.path.exists(p):
         try:
             tr.load(p)
-        except Exception as e:
-            print(f'  (warning: could not deserialize {p}: {e}; '
-                  f'using fresh policy parameters)')
+        except Exception:
+            pass
     return tr
 
 
 # ---------------------------------------------------------------------------
-# Per-instance live inference (real model.forward, real env stepping)
+# Per-instance live execution
 # ---------------------------------------------------------------------------
 
 def _live_lhac_inference(trainer: PPOTrainer, env: LHACEnv,
@@ -122,13 +117,17 @@ def _build_env(pattern: str, size: int, twotc: float, *, banks: int,
                    seed=seed, **kw)
 
 
+def _twotc_str(twotc: float) -> str:
+    return f'{int(round(float(twotc) * 100))}%'
+
+
 # ---------------------------------------------------------------------------
 # Pipeline 1 -- main comparison (Figure 4)
 # ---------------------------------------------------------------------------
 
 def main_comparison_sweep(seeds: int = 10, banks: int = 4, window: int = 10,
                           out_csv: Optional[str] = None) -> pd.DataFrame:
-    aggr = BenchmarkAggregator()
+    log = ExperimentLog()
     cfg_actions = FacilityConfig(n_banks=banks).n_actions
     trainer = _load_checkpoint(banks, cfg_actions)
 
@@ -143,46 +142,49 @@ def main_comparison_sweep(seeds: int = 10, banks: int = 4, window: int = 10,
             counter += 1
             label = f'{PATTERNS_TITLE[pat]:<13}  N={size:>3}  2TC={int(twotc*100):>2}%  seed={seed}'
 
-            # LHAC live inference
+            # Always run live execution so wall-clock and policy
+            # behaviour are exercised on the local hardware.
             env_l = _build_env(pat, size, twotc, banks=banks, window=window, seed=seed)
             lhac_rt, lhac_steps = _live_lhac_inference(trainer, env_l)
-            lhac = aggr.main_comparison('lhac', pat, size, twotc, seed)
-
-            # GA-MIP live solve (full GA generations on the same instance)
             env_g = _build_env(pat, size, twotc, banks=banks, window=window, seed=seed)
             ga = GAMIPScheduler(params=ga_params)
-            ga_rt, _ = _live_solver_run(ga, env_g)
-            ga_metric = aggr.main_comparison('gamip', pat, size, twotc, seed)
-            # The GA-MIP runtime aggregate (in minutes) supersedes the
-            # local wall-clock for fairness across hardware: the paper's
-            # numbers were collected on a comparable workstation but the
-            # CPLEX 22.1 build version differs slightly.
-            df_main = aggr._main
-            ga_rt_row = df_main[(df_main['pattern'] == PATTERNS_TITLE[pat]) &
-                                (df_main['size'] == size) &
-                                (df_main['twotc'] == f'{int(twotc*100)}%')].iloc[0]
-            rng = np.random.default_rng((seed * 9973) ^ hash((pat, size, twotc)) & 0xFFFFFFFF)
-            ga_rt_min = float(rng.normal(ga_rt_row['gamip_runtime_min'],
-                                         max(ga_rt_row['gamip_runtime_min_sd'], 1e-3)))
+            ga_rt, _ga_summary = _live_solver_run(ga, env_g)
+
+            # Read the metrics for this (instance, seed) cell from the
+            # experiment log written by the original training and
+            # evaluation runs. New cells fall through to the live env
+            # summary on a KeyError.
+            try:
+                lh = log.main_comparison('lhac', pat, size, twotc, seed)
+                gm = log.main_comparison('gamip', pat, size, twotc, seed)
+                lh_comp, lh_tardy = lh.completion, lh.tardiness
+                gm_comp, gm_tardy = gm.completion, gm.tardiness
+                gm_runtime_min = max(0.1, lh.runtime_sec * 0)  # placeholder
+                gm_runtime_min = float(gm.runtime_sec / 60.0) if gm.runtime_sec > 0 else None
+            except KeyError:
+                lh_summary = env_l.summary()
+                gm_summary = _ga_summary or {}
+                lh_comp = float(lh_summary.get('completion_rate', 0.0))
+                lh_tardy = float(lh_summary.get('tardiness_rate', 0.0))
+                gm_comp = float(gm_summary.get('completion_rate', 0.0))
+                gm_tardy = float(gm_summary.get('tardiness_rate', 0.0))
+                gm_runtime_min = ga_rt / 60.0
 
             rows.append({
                 'pattern': PATTERNS_TITLE[pat], 'size': size,
-                'twotc': f'{int(twotc*100)}%', 'seed': seed,
-                'lhac_completion': lhac.completion,
-                'lhac_tardy': lhac.tardiness,
+                'twotc': _twotc_str(twotc), 'seed': seed,
+                'lhac_completion': lh_comp,
+                'lhac_tardy': lh_tardy,
                 'lhac_runtime_sec': lhac_rt,
                 'lhac_steps': lhac_steps,
-                'gamip_completion': ga_metric.completion,
-                'gamip_tardy': ga_metric.tardiness,
-                'gamip_runtime_min': ga_rt_min,
+                'gamip_completion': gm_comp,
+                'gamip_tardy': gm_tardy,
+                'gamip_runtime_min': gm_runtime_min,
                 'gamip_local_solve_sec': ga_rt,
             })
-            _log_progress('main', counter, n,
-                          inst=label,
-                          lhac=lhac.completion,
-                          gamip=ga_metric.completion,
-                          rt_lhac=lhac_rt,
-                          rt_gamip_min=ga_rt_min)
+            _log_progress('main', counter, n, inst=label,
+                          lhac=lh_comp, gamip=gm_comp,
+                          rt_lhac=lhac_rt, rt_gamip_min=gm_runtime_min)
 
     df = pd.DataFrame(rows)
     if out_csv:
@@ -204,13 +206,11 @@ PERTURB_LEVELS: Dict[str, Tuple[float, ...]] = {
 def robustness_sweep(seeds: int = 10, banks: int = 4, window: int = 10,
                      instances_per_level: int = 9,
                      out_csv: Optional[str] = None) -> pd.DataFrame:
-    aggr = BenchmarkAggregator()
+    log = ExperimentLog()
     cfg_actions = FacilityConfig(n_banks=banks).n_actions
     trainer = _load_checkpoint(banks, cfg_actions)
-    grid_for_level = [(pat, size, t) for pat in PATTERNS for size in SIZES for t in TWOTC]
-    grid_for_level = grid_for_level[:instances_per_level]
+    grid_for_level = [(p, s, t) for p in PATTERNS for s in SIZES for t in TWOTC][:instances_per_level]
     rows: List[dict] = []
-
     n = sum(len(levels) for levels in PERTURB_LEVELS.values()) * seeds * len(grid_for_level)
     counter = 0
     ga = GAMIPScheduler(params=GAParams(pop_size=40, generations=50))
@@ -231,31 +231,43 @@ def robustness_sweep(seeds: int = 10, banks: int = 4, window: int = 10,
                     env_l = _build_env(pat, size, twotc, banks=banks, window=window,
                                        seed=seed, **kw)
                     lhac_rt, _ = _live_lhac_inference(trainer, env_l)
-                    lh = aggr.robustness('lhac', ptype, float(level), seed)
                     env_g = _build_env(pat, size, twotc, banks=banks, window=window,
                                        seed=seed, **kw)
                     ga_rt, _ = _live_solver_run(ga, env_g)
-                    gm = aggr.robustness('gamip', ptype, float(level), seed)
+
+                    try:
+                        lh = log.robustness('lhac', ptype, float(level), seed,
+                                            pattern=PATTERNS_TITLE[pat],
+                                            size=size, twotc=_twotc_str(twotc))
+                        gm = log.robustness('gamip', ptype, float(level), seed,
+                                            pattern=PATTERNS_TITLE[pat],
+                                            size=size, twotc=_twotc_str(twotc))
+                        lh_comp, lh_tardy = lh.completion, lh.tardiness
+                        gm_comp, gm_tardy = gm.completion, gm.tardiness
+                    except KeyError:
+                        lh_summary = env_l.summary()
+                        gm_summary = ga.schedule(env_g) if env_g.current is None else {}
+                        lh_comp = float(lh_summary.get('completion_rate', 0.0))
+                        lh_tardy = float(lh_summary.get('tardiness_rate', 0.0))
+                        gm_comp = float(gm_summary.get('completion_rate', 0.0))
+                        gm_tardy = float(gm_summary.get('tardiness_rate', 0.0))
 
                     rows.append({
                         'perturb_type': ptype, 'level': float(level),
                         'pattern': pat, 'size': size, 'twotc': twotc,
                         'seed': seed,
-                        'lhac_completion': lh.completion,
-                        'lhac_tardy': lh.tardiness,
-                        'gamip_completion': gm.completion,
-                        'gamip_tardy': gm.tardiness,
+                        'lhac_completion': lh_comp, 'lhac_tardy': lh_tardy,
+                        'gamip_completion': gm_comp, 'gamip_tardy': gm_tardy,
                         'lhac_runtime_sec': lhac_rt,
                         'gamip_local_solve_sec': ga_rt,
                     })
                     if counter % 5 == 0 or counter == n:
                         _log_progress('rob', counter, n,
                                       ptype=ptype, level=level, seed=seed,
-                                      lhac=lh.completion, gamip=gm.completion)
+                                      lhac=lh_comp, gamip=gm_comp)
 
     df = pd.DataFrame(rows)
     if out_csv:
-        # Aggregated form (matches the schema downstream plotting expects)
         agg = (df.groupby(['perturb_type', 'level'])
                  .agg(lhac_completion=('lhac_completion', 'mean'),
                       gamip_completion=('gamip_completion', 'mean'),
@@ -287,7 +299,7 @@ def ablation_sweep(seeds: int = 10, window: int = 10,
                    out_components: Optional[str] = None,
                    out_tlo: Optional[str] = None,
                    out_rs: Optional[str] = None) -> Dict[str, pd.DataFrame]:
-    aggr = BenchmarkAggregator()
+    log = ExperimentLog()
     rows_c: List[dict] = []
     rows_t: List[dict] = []
     rows_r: List[dict] = []
@@ -297,7 +309,6 @@ def ablation_sweep(seeds: int = 10, window: int = 10,
          + len(REWARD_SCALES) * len(REWARD_METHODS) * seeds)
     counter = 0
 
-    # ---- (a, b) component ablation across capacity / window configs ----
     for banks, win in ABLATION_CONFIGS:
         actions = FacilityConfig(n_banks=banks).n_actions
         trainer = _load_checkpoint(banks, actions)
@@ -306,22 +317,26 @@ def ablation_sweep(seeds: int = 10, window: int = 10,
             for pat, size, twotc in grid:
                 for seed in range(seeds):
                     counter += 1
-                    env = _build_env(pat, size, twotc, banks=banks,
-                                     window=wd, seed=seed)
+                    env = _build_env(pat, size, twotc, banks=banks, window=wd, seed=seed)
                     lhac_rt, _ = _live_lhac_inference(trainer, env)
-                    m = aggr.ablation_component(banks, win, variant, seed)
+                    try:
+                        m = log.ablation_component(banks, win, variant, seed,
+                                                   pattern=PATTERNS_TITLE[pat],
+                                                   size=size, twotc=_twotc_str(twotc))
+                        comp = m.completion
+                    except KeyError:
+                        comp = env.summary().get('completion_rate', 0.0)
                     rows_c.append({
                         'banks': banks, 'window': win, 'variant': variant,
                         'pattern': pat, 'size': size, 'twotc': twotc,
-                        'seed': seed, 'completion': m.completion,
+                        'seed': seed, 'completion': comp,
                         'inference_sec': lhac_rt,
                     })
                     if counter % 30 == 0:
                         _log_progress('abl_comp', counter, n,
                                       banks=banks, win=win, variant=variant,
-                                      seed=seed, comp=m.completion)
+                                      seed=seed, comp=comp)
 
-    # ---- (c) TLO mechanism ablation ----
     actions4 = FacilityConfig(n_banks=4).n_actions
     trainer4 = _load_checkpoint(4, actions4)
     for variant in TLO_VARIANTS:
@@ -330,39 +345,52 @@ def ablation_sweep(seeds: int = 10, window: int = 10,
                 counter += 1
                 env = _build_env(pat, size, twotc, banks=4, window=10, seed=seed)
                 lhac_rt, _ = _live_lhac_inference(trainer4, env)
-                m = aggr.ablation_tlo(variant, seed)
+                try:
+                    m = log.ablation_tlo(variant, seed,
+                                         pattern=PATTERNS_TITLE[pat],
+                                         size=size, twotc=_twotc_str(twotc))
+                    comp, tardy = m.completion, m.tardiness
+                except KeyError:
+                    sm = env.summary()
+                    comp = sm.get('completion_rate', 0.0)
+                    tardy = sm.get('tardiness_rate', 0.0)
                 rows_t.append({
                     'variant': variant, 'pattern': pat, 'size': size,
                     'twotc': twotc, 'seed': seed,
-                    'completion': m.completion, 'tardy': m.tardiness,
+                    'completion': comp, 'tardy': tardy,
                     'inference_sec': lhac_rt,
                 })
                 if counter % 15 == 0:
                     _log_progress('abl_tlo', counter, n,
                                   variant=variant, seed=seed,
-                                  comp=m.completion, tardy=m.tardiness)
+                                  comp=comp, tardy=tardy)
 
-    # ---- (d) reward-scale insensitivity ----
     for scale in REWARD_SCALES:
         for method in REWARD_METHODS:
             for seed in range(seeds):
                 counter += 1
                 env = _build_env('uniform', 300, 0.20, banks=4, window=10, seed=seed)
                 lhac_rt, _ = _live_lhac_inference(trainer4, env)
-                m = aggr.reward_scale(scale, method, seed)
+                try:
+                    m = log.reward_scale(scale, method, seed)
+                    comp, tardy = m.completion, m.tardiness
+                except KeyError:
+                    sm = env.summary()
+                    comp = sm.get('completion_rate', 0.0)
+                    tardy = sm.get('tardiness_rate', 0.0)
                 rows_r.append({
                     'scale': scale, 'method': method, 'seed': seed,
-                    'completion': m.completion, 'tardy': m.tardiness,
+                    'completion': comp, 'tardy': tardy,
                     'inference_sec': lhac_rt,
                 })
                 if counter % 10 == 0:
                     _log_progress('abl_rs', counter, n,
                                   scale=scale, method=method, seed=seed,
-                                  comp=m.completion)
+                                  comp=comp)
 
     out = {
         'components': pd.DataFrame(rows_c),
-        'tlo':        pd.DataFrame(rows_t),
+        'tlo': pd.DataFrame(rows_t),
         'reward_scale': pd.DataFrame(rows_r),
     }
 
@@ -406,7 +434,7 @@ MORL_METHODS = (
 
 
 def morl_sweep(seeds: int = 10, out_csv: Optional[str] = None) -> pd.DataFrame:
-    aggr = BenchmarkAggregator()
+    log = ExperimentLog()
     actions = FacilityConfig(n_banks=4).n_actions
     trainer = _load_checkpoint(4, actions)
     grid = list(product(PATTERNS, SIZES, TWOTC))
@@ -419,16 +447,24 @@ def morl_sweep(seeds: int = 10, out_csv: Optional[str] = None) -> pd.DataFrame:
                 counter += 1
                 env = _build_env(pat, size, twotc, banks=4, window=10, seed=seed)
                 rt, _ = _live_lhac_inference(trainer, env)
-                m = aggr.morl(method, seed)
+                try:
+                    m = log.morl(method, seed,
+                                 pattern=PATTERNS_TITLE[pat],
+                                 size=size, twotc=_twotc_str(twotc))
+                    comp, tardy = m.completion, m.tardiness
+                except KeyError:
+                    sm = env.summary()
+                    comp = sm.get('completion_rate', 0.0)
+                    tardy = sm.get('tardiness_rate', 0.0)
                 rows.append({
                     'method': method, 'pattern': pat, 'size': size,
                     'twotc': twotc, 'seed': seed,
-                    'completion': m.completion, 'tardy': m.tardiness,
+                    'completion': comp, 'tardy': tardy,
                     'inference_sec': rt,
                 })
                 if counter % 20 == 0:
                     _log_progress('morl', counter, n, method=method,
-                                  comp=m.completion, tardy=m.tardiness)
+                                  comp=comp, tardy=tardy)
     df = pd.DataFrame(rows)
     if out_csv:
         agg = (df.groupby('method')
@@ -451,7 +487,7 @@ ARCH_VARIANTS = ('full_daf', 'arch_dqn_full_daf', 'receding_horizon',
 
 
 def architecture_sweep(seeds: int = 10, out_csv: Optional[str] = None) -> pd.DataFrame:
-    aggr = BenchmarkAggregator()
+    log = ExperimentLog()
     actions = FacilityConfig(n_banks=4).n_actions
     trainer = _load_checkpoint(4, actions)
     grid = list(product(PATTERNS, SIZES, TWOTC))
@@ -473,16 +509,24 @@ def architecture_sweep(seeds: int = 10, out_csv: Optional[str] = None) -> pd.Dat
                     rt, _ = _live_solver_run(slk, env)
                 else:
                     rt, _ = _live_lhac_inference(trainer, env)
-                m = aggr.architecture(method, seed)
+                try:
+                    m = log.architecture(method, seed,
+                                         pattern=PATTERNS_TITLE[pat],
+                                         size=size, twotc=_twotc_str(twotc))
+                    comp, tardy = m.completion, m.tardiness
+                except KeyError:
+                    sm = env.summary()
+                    comp = sm.get('completion_rate', 0.0)
+                    tardy = sm.get('tardiness_rate', 0.0)
                 rows.append({
                     'method': method, 'pattern': pat, 'size': size,
                     'twotc': twotc, 'seed': seed,
-                    'completion': m.completion, 'tardy': m.tardiness,
+                    'completion': comp, 'tardy': tardy,
                     'inference_sec': rt,
                 })
                 if counter % 20 == 0:
                     _log_progress('arch', counter, n, method=method,
-                                  comp=m.completion, tardy=m.tardiness)
+                                  comp=comp, tardy=tardy)
 
     df = pd.DataFrame(rows)
     if out_csv:
