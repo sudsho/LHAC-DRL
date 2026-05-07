@@ -1,23 +1,20 @@
 """Figure 6 -- 4-panel ablation suite.
 
-  python reproduce/reproduce_fig6_ablation.py \
-         --data data/industrial_servers_2024.csv --seeds 10
+  python reproduce/reproduce_fig6_ablation.py
 
 (a) Component ablation @ 4-bank/10-day
 (b) Component ablation @ 1-bank/10-day
 (c) TLO mechanism ablation
 (d) Reward-scale insensitivity (line chart, 100x range)
 
-The full sweep retrains and evaluates every variant; aggregated
-results are written to results/ablation_*.csv. Pass `--use-cache`
-to plot directly from a prior run.
+Reads the corresponding CSV files under results/ and writes
+figures/Figure_06_Ablation.png.
 """
 from __future__ import annotations
 
 import argparse
 import os
 import sys
-import time
 
 import numpy as np
 import pandas as pd
@@ -27,13 +24,10 @@ THIS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(THIS)
 if THIS not in sys.path:
     sys.path.insert(0, THIS)
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
 
 from _common import (RESULTS, COLOR_LHAC, COLOR_GRAY_LIGHT,
                      COLOR_GRAY_FAINT, COLOR_GRAY_DARK,
                      LINE_PALETTE, out)
-from _pipeline import ablation_sweep
 
 VARIANT_ORDER = ['full_daf', 'case_fpr', 'dap_case', 'dap_fpr',
                  'case_only', 'dap_only', 'fpr_only', 'baseline_lhac']
@@ -143,38 +137,14 @@ def panel_reward_scale(ax, df_rs):
     ax.legend(loc='lower center', fontsize=9, ncol=2, frameon=True, framealpha=0.95)
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument('--data', default='data/industrial_servers_2024.csv')
-    p.add_argument('--seeds', type=int, default=10)
-    p.add_argument('--use-cache', action='store_true')
-    return p.parse_args()
-
-
 def main() -> None:
-    args = parse_args()
-    out_path = out('Figure_06_Ablation.png')
-    p_c = os.path.join(RESULTS, 'ablation_components.csv')
-    p_t = os.path.join(RESULTS, 'ablation_tlo.csv')
-    p_r = os.path.join(RESULTS, 'ablation_reward_scale.csv')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--use-cache', action='store_true')
+    parser.parse_args()
 
-    if not args.use_cache:
-        if os.path.exists(args.data):
-            print(f'[load] using confidential dataset: {args.data}')
-        else:
-            print(f'[load] {args.data} not present; using calibrated synthetic'
-                  f' instances')
-        print(f'[sweep] component / TLO / reward-scale ablations x {args.seeds} seeds')
-        t0 = time.time()
-        ablation_sweep(seeds=args.seeds,
-                       out_components=p_c, out_tlo=p_t, out_rs=p_r)
-        print(f'\n[done] ablation sweep completed in {(time.time() - t0)/60:.1f} min')
-    else:
-        print('[cache] reading aggregated ablation statistics...')
-
-    df_comp = pd.read_csv(p_c)
-    df_tlo  = pd.read_csv(p_t)
-    df_rs   = pd.read_csv(p_r)
+    df_comp = pd.read_csv(os.path.join(RESULTS, 'ablation_components.csv'))
+    df_tlo  = pd.read_csv(os.path.join(RESULTS, 'ablation_tlo.csv'))
+    df_rs   = pd.read_csv(os.path.join(RESULTS, 'ablation_reward_scale.csv'))
 
     fig, ((a, b), (c, d)) = plt.subplots(2, 2, figsize=(20, 14))
     fig.patch.set_facecolor('white')
@@ -187,6 +157,7 @@ def main() -> None:
     panel_tlo(c, df_tlo)
     panel_reward_scale(d, df_rs)
     fig.tight_layout(pad=2.5)
+    out_path = out('Figure_06_Ablation.png')
     fig.savefig(out_path, dpi=600, bbox_inches='tight', pad_inches=0.25,
                 facecolor='white', edgecolor='none')
     plt.close(fig)

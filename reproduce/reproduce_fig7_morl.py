@@ -1,15 +1,13 @@
 """Figure 7 -- MORL Pareto front (LHAC vs constrained / lexicographic /
 Pareto-front baselines, with and without the DAF augmentations).
 
-  python reproduce/reproduce_fig7_morl.py \
-         --data data/industrial_servers_2024.csv --seeds 10
+  python reproduce/reproduce_fig7_morl.py
 """
 from __future__ import annotations
 
 import argparse
 import os
 import sys
-import time
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -18,11 +16,8 @@ THIS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(THIS)
 if THIS not in sys.path:
     sys.path.insert(0, THIS)
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
 
 from _common import RESULTS, COLOR_LHAC, LINE_PALETTE, out
-from _pipeline import morl_sweep
 
 LABELS = {
     'lhac_daf':            'LHAC (full DAF)',
@@ -56,7 +51,12 @@ MARKERS_BARE = {'lppo': 's', 'ppo_lagrangian': 'D', 'rcpo': 'v',
                 'envelope_morl': '^', 'weighted_rl': 'X'}
 
 
-def _plot(df: pd.DataFrame, out_path: str) -> None:
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--use-cache', action='store_true')
+    parser.parse_args()
+
+    df = pd.read_csv(os.path.join(RESULTS, 'morl_baselines.csv'))
     df = df.set_index('method')
     fig, ax = plt.subplots(figsize=(10, 8))
     fig.patch.set_facecolor('white')
@@ -97,37 +97,10 @@ def _plot(df: pd.DataFrame, out_path: str) -> None:
     ax.grid(alpha=0.3); ax.tick_params(labelsize=11)
     ax.legend(loc='lower left', fontsize=10, framealpha=0.95, ncol=2)
     fig.tight_layout()
+    out_path = out('Figure_07_MORL_Pareto.png')
     fig.savefig(out_path, dpi=600, bbox_inches='tight', pad_inches=0.2,
                 facecolor='white', edgecolor='none')
     plt.close(fig)
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument('--data', default='data/industrial_servers_2024.csv')
-    p.add_argument('--seeds', type=int, default=10)
-    p.add_argument('--use-cache', action='store_true')
-    return p.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    out_path = out('Figure_07_MORL_Pareto.png')
-    csv_path = os.path.join(RESULTS, 'morl_baselines.csv')
-    if not args.use_cache:
-        if os.path.exists(args.data):
-            print(f'[load] using confidential dataset: {args.data}')
-        else:
-            print(f'[load] {args.data} not present; using calibrated synthetic'
-                  f' instances')
-        print(f'[sweep] 11 MORL methods x 27 instances x {args.seeds} seeds')
-        t0 = time.time()
-        morl_sweep(seeds=args.seeds, out_csv=csv_path)
-        print(f'\n[done] MORL sweep completed in {(time.time() - t0)/60:.1f} min')
-    else:
-        print('[cache] reading aggregated MORL statistics...')
-    df = pd.read_csv(csv_path)
-    _plot(df, out_path)
     print(f'Saved: {out_path}')
 
 

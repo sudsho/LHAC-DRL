@@ -6,7 +6,6 @@ from .networks import ActorCritic, CASEEncoder
 from .ppo import PPOTrainer
 from .tlo import AdaptiveTLOFilter
 from .data import generate_dataset, DataGenerator
-from .aggregator import BenchmarkAggregator, Metric
 
 __version__ = "1.0.0"
 

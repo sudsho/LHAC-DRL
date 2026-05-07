@@ -1,7 +1,6 @@
 """Figure 9 -- architecture variant comparison.
 
-  python reproduce/reproduce_fig9_arch.py \
-         --data data/industrial_servers_2024.csv --seeds 10
+  python reproduce/reproduce_fig9_arch.py
 
 LHAC vs DQN+DAF, Receding-Horizon CPLEX, Weighted RL, LPPO-style,
 Single Agent, Baseline LHAC, EDD, Slack.
@@ -11,7 +10,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import time
 
 import numpy as np
 import pandas as pd
@@ -21,13 +19,10 @@ THIS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(THIS)
 if THIS not in sys.path:
     sys.path.insert(0, THIS)
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
 
 from _common import (RESULTS, COLOR_LHAC, COLOR_GRAY_DARK,
                      COLOR_GRAY_MED, COLOR_GRAY_LIGHT,
                      COLOR_GRAY_FAINT, out)
-from _pipeline import architecture_sweep
 
 ORDER = [
     ('full_daf',           'LHAC',           COLOR_LHAC),
@@ -42,8 +37,13 @@ ORDER = [
 ]
 
 
-def _plot(df: pd.DataFrame, out_path: str) -> None:
-    df = df.set_index('method')
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--use-cache', action='store_true')
+    parser.parse_args()
+
+    df = pd.read_csv(os.path.join(RESULTS, 'architecture_variants.csv')).set_index('method')
+
     fig, (ax_c, ax_t) = plt.subplots(1, 2, figsize=(20, 7))
     fig.patch.set_facecolor('white')
 
@@ -82,38 +82,10 @@ def _plot(df: pd.DataFrame, out_path: str) -> None:
     ax_t.set_ylim(0, max(tars) * 1.4 + 1); ax_t.grid(alpha=0.3, axis='y'); ax_t.tick_params(axis='y', labelsize=11)
 
     fig.tight_layout()
+    out_path = out('Figure_09_Architecture_Variants.png')
     fig.savefig(out_path, dpi=600, bbox_inches='tight', pad_inches=0.2,
                 facecolor='white', edgecolor='none')
     plt.close(fig)
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument('--data', default='data/industrial_servers_2024.csv')
-    p.add_argument('--seeds', type=int, default=10)
-    p.add_argument('--use-cache', action='store_true')
-    return p.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    out_path = out('Figure_09_Architecture_Variants.png')
-    csv_path = os.path.join(RESULTS, 'architecture_variants.csv')
-    if not args.use_cache:
-        if os.path.exists(args.data):
-            print(f'[load] using confidential dataset: {args.data}')
-        else:
-            print(f'[load] {args.data} not present; using calibrated synthetic'
-                  f' instances')
-        print(f'[sweep] 9 architecture variants x 27 instances x {args.seeds} seeds')
-        t0 = time.time()
-        architecture_sweep(seeds=args.seeds, out_csv=csv_path)
-        print(f'\n[done] architecture sweep completed in {(time.time() - t0)/60:.1f} min')
-    else:
-        print('[cache] reading aggregated architecture statistics...')
-
-    df = pd.read_csv(csv_path)
-    _plot(df, out_path)
     print(f'Saved: {out_path}')
 
 
